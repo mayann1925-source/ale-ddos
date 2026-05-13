@@ -1,9 +1,3 @@
-#!/usr/bin/env python3
-"""
-MHDDoS-Style Attack Framework with Auto-Proxy Providers
-For authorized penetration testing only.
-"""
-
 import os
 import sys
 import json
@@ -41,6 +35,14 @@ try:
     COLORS = True
 except ImportError:
     COLORS = False
+    class _DummyFore:
+        def __getattr__(self, name):
+            return ''
+    class _DummyStyle:
+        def __getattr__(self, name):
+            return ''
+    Fore = _DummyFore()
+    Style = _DummyStyle()
 
 
 def c(text: str, color: str = "") -> str:
@@ -859,7 +861,7 @@ class ToolsConsole:
     ██  ██  ██ ██   ██ ██   ██ ██      ██   ██      ██
     ██      ██ ██   ██ ██████   ██████  ██████  ███████
     ====================================================
-      Auto-Proxy Attack Framework | Authorized Testing
+      FUCK THE | SHIT
     ====================================================
     """
 
