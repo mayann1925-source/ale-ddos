@@ -844,7 +844,7 @@ def _checksum(self, data: bytes) -> int:
         total += total >> 16
         return ~total & 0xFFFF
 
-    def worker_dns(self, worker_id: int):
+    def worker_dns(self, worker_id: int)
         """DNS amplification worker."""
         resolvers = [
             "8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1",
