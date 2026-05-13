@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+"""
+MHDDoS-Style Attack Framework with Auto-Proxy Providers
+For authorized penetration testing only.
+"""
+
 import os
 import sys
 import json
@@ -853,7 +859,7 @@ class ToolsConsole:
     ██  ██  ██ ██   ██ ██   ██ ██      ██   ██      ██
     ██      ██ ██   ██ ██████   ██████  ██████  ███████
     ====================================================
-      CREDS BY: ALE | FUCK THIS SHIT
+      Auto-Proxy Attack Framework | Authorized Testing
     ====================================================
     """
 
