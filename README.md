@@ -16,7 +16,7 @@ cd ale-ddos
 
 
 
-git pull
+
 
 
 
